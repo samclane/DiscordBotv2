@@ -62,7 +62,7 @@ class VoiceCog(commands.Cog):
         tts_url = "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}".format(
             voice_id="EXAVITQu4vr4xnSDxMaL"
         )
-        model_id = "eleven_turbo_v2"
+        model_id = "eleven_flash_v2"
         formatted_message = {
             "model_id": model_id,
             "text": line,
