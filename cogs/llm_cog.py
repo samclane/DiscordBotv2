@@ -13,25 +13,38 @@ prompt_template = "You are a Discord bot who occasionally chimes in with insight
 "{messages}\n" \
 "Put your response here: "
 
-RESPONSE_CHANCE = 0.1
+RESPONSE_CHANCE = .1
+MESSAGE_LIMIT = 50
+MODEL = "models/gemini-2.0-flash-exp"
 
 @app_commands.guild_only()
 class LLMCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-        self.model = genai.GenerativeModel("models/gemini-2.0-flash-exp")
+        self.model_name = MODEL
+        self.model = genai.GenerativeModel(self.model_name)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if message.author == self.bot.user:
             return
 
-        # occasionally chime in with a response
         if random.random() < RESPONSE_CHANCE:
-            # get the last 5 messages
-            messages = [msg async for msg in message.channel.history(limit=5)]
-            messages_text = "\n".join([f"{m.author}: {m.content}" for m in messages])
+            filled_messages = []
+            current_tokens = 0
+            MAX_TOKENS = genai.get_model(self.model_name).input_token_limit
+
+            async for msg in message.channel.history(limit=MESSAGE_LIMIT, oldest_first=False):
+                tokens_count = self.model.count_tokens(msg.content).total_tokens if msg.content else 0
+                if current_tokens + tokens_count > MAX_TOKENS:
+                    break
+                filled_messages.append(msg)
+                current_tokens += tokens_count
+
+            messages_text = "\n".join(
+                f"{m.author}: {m.content}" for m in reversed(filled_messages)
+            )
             prompt = prompt_template.format(messages=messages_text, name=self.bot.user.name)
             response = self.model.generate_content(prompt).text
             await message.channel.send(response)
