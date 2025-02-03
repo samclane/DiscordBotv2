@@ -1,11 +1,11 @@
 import random
 import time
-import re
 import discord
 from discord import app_commands
 from discord.ext import commands
 import os
 import google.generativeai as genai
+import json
 
 prompt_template = (
     "You are a Discord bot who occasionally chimes in with insights and comments related to the conversation. "
@@ -19,16 +19,19 @@ prompt_template = (
     "Put your response here: "
 )
 
+ner_template = (
+    "You are an extremely simple Named Entity Recognition model. "
+    "Your only job is to determine wheter the message is talking about the discord bot or not. "
+    "Here's the message: \n"
+    "{message}\n"
+    "Put your response here: "
+)
+
+
 RESPONSE_CHANCE = 0.1
 MESSAGE_LIMIT = 100
 MODEL = "models/gemini-2.0-flash-exp"
 MESSAGE_RECENCY_SECONDS = 300
-TRIGGER_KEYWORDS = ["bot", "the bot"]
-
-TRIGGER_PATTERNS = [
-    re.compile(r'\b' + re.escape(keyword) + r'\b', re.IGNORECASE)
-    for keyword in TRIGGER_KEYWORDS
-]
 
 @app_commands.guild_only()
 class LLMCog(commands.Cog):
@@ -38,6 +41,17 @@ class LLMCog(commands.Cog):
         self.model_name = MODEL
         self.model = genai.GenerativeModel(self.model_name)
         self.recent_chats = {}
+
+    def is_about_bot(self, message: str):
+        bot_response = self.model.generate_content(
+            ner_template.format(message=message),
+            generation_config=genai.GenerationConfig(
+                response_mime_type="application/json", response_schema=bool))
+        try:
+            json_response = json.loads(bot_response.text)
+            return bool(json_response)
+        except json.JSONDecodeError:
+            return False
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -52,8 +66,7 @@ class LLMCog(commands.Cog):
         if self.bot.user.mentioned_in(message) or active:
             should_respond = True
         else:
-            # Use the compiled regex patterns for a more precise match
-            if any(pattern.search(message.content) for pattern in TRIGGER_PATTERNS):
+            if self.is_about_bot(message.content):
                 should_respond = True
             else:
                 should_respond = random.random() < RESPONSE_CHANCE
