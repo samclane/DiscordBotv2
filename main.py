@@ -9,6 +9,7 @@ from cogs.inventory_cog import InventoryCog
 from cogs.joined_cog import JoinedCog
 from cogs.llm_cog import LLMCog
 from cogs.role_cog import RoleCog
+
 # from cogs.stocks_cog import StocksCog
 from cogs.utilities_cog import UtilitiesCog
 from cogs.voice_cog import VoiceCog
