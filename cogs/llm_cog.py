@@ -72,22 +72,23 @@ class LLMCog(commands.Cog):
                 should_respond = random.random() < RESPONSE_CHANCE
 
         if should_respond:
-            # Gather context from channel history
-            filled_messages = []
-            current_tokens = 0
-            MAX_TOKENS = genai.get_model(self.model_name).input_token_limit
+            async with message.channel.typing():
+                # Gather context from channel history
+                filled_messages = []
+                current_tokens = 0
+                MAX_TOKENS = genai.get_model(self.model_name).input_token_limit
 
-            async for msg in message.channel.history(limit=MESSAGE_LIMIT, oldest_first=False):
-                tokens_count = self.model.count_tokens(msg.content).total_tokens if msg.content else 0
-                if current_tokens + tokens_count > MAX_TOKENS:
-                    break
-                filled_messages.append(msg)
-                current_tokens += tokens_count
+                async for msg in message.channel.history(limit=MESSAGE_LIMIT, oldest_first=False):
+                    tokens_count = self.model.count_tokens(msg.content).total_tokens if msg.content else 0
+                    if current_tokens + tokens_count > MAX_TOKENS:
+                        break
+                    filled_messages.append(msg)
+                    current_tokens += tokens_count
 
-            messages_text = "\n".join(
-                f"{m.author}: {m.content}" for m in reversed(filled_messages)
-            )
-            prompt = prompt_template.format(messages=messages_text, name=self.bot.user.name, number=len(filled_messages))
-            response = self.model.generate_content(prompt).text
-            await message.channel.send(response)
-            self.recent_chats[message.channel.id] = now
+                messages_text = "\n".join(
+                    f"{m.author}: {m.content}" for m in reversed(filled_messages)
+                )
+                prompt = prompt_template.format(messages=messages_text, name=self.bot.user.name, number=len(filled_messages))
+                response = self.model.generate_content(prompt).text
+                await message.channel.send(response)
+                self.recent_chats[message.channel.id] = now
