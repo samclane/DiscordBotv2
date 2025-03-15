@@ -114,31 +114,31 @@ class VoiceCog(commands.Cog):
                         if len(members) == 1:
                             messages.append(f"{members[0].name} has joined")
                         elif len(members) == 2:
-                            messages.append(f"{members[0].name} and {members[1].name} have joined")
+                            messages.append(f"{members[0].name} and {members[1].name} have joined.")
                         else:
                             names = [m.name for m in members[:-1]]
                             last_name = members[-1].name
-                            messages.append(f"{', '.join(names)}, and {last_name} have joined")
+                            messages.append(f"{', '.join(names)}, and {last_name} have joined.")
                     
                     elif event_type == EventType.LEAVE:
                         if len(members) == 1:
                             messages.append(f"{members[0].name} has left")
                         elif len(members) == 2:
-                            messages.append(f"{members[0].name} and {members[1].name} have left")
+                            messages.append(f"{members[0].name} and {members[1].name} have left.")
                         else:
                             names = [m.name for m in members[:-1]]
                             last_name = members[-1].name
-                            messages.append(f"{', '.join(names)}, and {last_name} have left")
+                            messages.append(f"{', '.join(names)}, and {last_name} have left.")
                     
                     elif event_type == EventType.AFK:
                         if len(members) == 1:
                             messages.append(f"{members[0].name} went A.F.K")
                         elif len(members) == 2:
-                            messages.append(f"{members[0].name} and {members[1].name} went A.F.K")
+                            messages.append(f"{members[0].name} and {members[1].name} went A.F.K.")
                         else:
                             names = [m.name for m in members[:-1]]
                             last_name = members[-1].name
-                            messages.append(f"{', '.join(names)}, and {last_name} went A.F.K")
+                            messages.append(f"{', '.join(names)}, and {last_name} went A.F.K.")
                 
                 # Combine all messages for this channel
                 if messages:
