@@ -25,7 +25,7 @@ class VoiceCog(commands.Cog):
         # Active tasks that process voice queues (guild_id -> task)
         self.queue_tasks = {}
         # Batch timeout (seconds to wait before processing events)
-        self.batch_timeout = 1.5
+        self.batch_timeout = 0.5
 
     @commands.Cog.listener()
     async def on_voice_state_update(
