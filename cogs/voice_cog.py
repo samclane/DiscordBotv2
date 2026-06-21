@@ -51,17 +51,24 @@ class VoiceCog(commands.Cog):
         if before.channel == after.channel:
             return
 
-        # Leaving a voice channel or going afk
-        if before.channel is not None and not isinstance(
-            before.channel, discord.StageChannel
+        afk_channel = member.guild.afk_channel
+
+        # Leaving a voice channel. Don't announce departures from the AFK
+        # channel since it's muted and everyone inside is afk.
+        if (
+            before.channel is not None
+            and not isinstance(before.channel, discord.StageChannel)
+            and before.channel != afk_channel
         ):
-            if after.channel == before.channel.guild.afk_channel:
+            # Moving into the AFK channel: announce "went afk" in the channel
+            # they left instead of a normal departure.
+            if after.channel == afk_channel:
                 await self.afk_user(member, before.channel)
             else:
                 await self.depart_user(member, before.channel)
 
-        # Joining a voice channel
-        if after.channel is not None:
+        # Joining a voice channel. Don't announce joins to the AFK channel.
+        if after.channel is not None and after.channel != afk_channel:
             await self.greet_user(member)
 
     async def greet_user(self, member: discord.Member):
