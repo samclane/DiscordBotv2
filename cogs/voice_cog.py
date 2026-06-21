@@ -1,13 +1,20 @@
 import asyncio
+import itertools
 from io import BytesIO
 import discord
 from discord.ext import commands
 from aiogtts import aiogTTS  # type: ignore
-import aiohttp
 import os
-from audiofix import FFmpegPCMAudio
+from elevenlabs.client import ElevenLabs
+from audiofix import FFmpegStreamAudio
 from collections import defaultdict
 from enum import Enum, auto
+
+# ElevenLabs voice/model configuration.
+ELEVENLABS_VOICE_ID = "EXAVITQu4vr4xnSDxMaL"
+ELEVENLABS_MODEL_ID = "eleven_flash_v2_5"
+# Streaming-friendly mp3 output; ffmpeg decodes it to Discord PCM on the fly.
+ELEVENLABS_OUTPUT_FORMAT = "mp3_44100_128"
 
 
 class EventType(Enum):
@@ -20,6 +27,8 @@ class VoiceCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.aiogtts = aiogTTS()
+        api_key = os.environ.get("XI_API_KEY")
+        self.elevenlabs = ElevenLabs(api_key=api_key) if api_key else None
         # Queue for each guild (guild_id -> list of (event_type, member, channel) tuples)
         self.voice_queues = defaultdict(list)
         # Active tasks that process voice queues (guild_id -> task)
@@ -156,58 +165,62 @@ class VoiceCog(commands.Cog):
         except Exception as e:
             print(f"Error playing voice line: {e}")
 
+    async def _open_elevenlabs_stream(self, line: str):
+        """Start an ElevenLabs streaming request and return a byte iterator.
+
+        The first chunk is pulled eagerly (in a thread) so connection/auth errors
+        surface here and we can fall back, while keeping the stream lazy afterwards.
+        """
+        if self.elevenlabs is None:
+            raise RuntimeError("ElevenLabs API key not configured (XI_API_KEY)")
+
+        def _start():
+            stream = self.elevenlabs.text_to_speech.stream(
+                ELEVENLABS_VOICE_ID,
+                text=line,
+                model_id=ELEVENLABS_MODEL_ID,
+                output_format=ELEVENLABS_OUTPUT_FORMAT,
+            )
+            iterator = iter(stream)
+            first_chunk = next(iterator)
+            return itertools.chain([first_chunk], iterator)
+
+        return await asyncio.to_thread(_start)
+
+    async def _build_audio_source(self, line: str) -> FFmpegStreamAudio:
+        """Build a streaming audio source, falling back to aiogTTS on failure."""
+        try:
+            byte_iterator = await self._open_elevenlabs_stream(line)
+            return FFmpegStreamAudio(byte_iterator)
+        except Exception as e:
+            print(f"ElevenLabs streaming failed ({e}); falling back to aiogTTS")
+            buffer = BytesIO()
+            await self.aiogtts.write_to_fp(line, buffer)
+            buffer.seek(0)
+            return FFmpegStreamAudio(iter([buffer.read()]))
+
     async def _play_voice_line(self, line: str, channel: discord.VoiceChannel, guild_id: int):
         """Internal method that actually plays the voice line."""
-        buffer = BytesIO()
-
-        tts_url = "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}".format(
-            voice_id="EXAVITQu4vr4xnSDxMaL"
-        )
-        model_id = "eleven_flash_v2_5"
-        formatted_message = {
-            "model_id": model_id,
-            "text": line,
-        }
-
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                tts_url,
-                headers={
-                    "Content-Type": "application/json",
-                    "xi-api-key": os.environ["XI_API_KEY"],
-                },
-                json=formatted_message,
-            ) as response:
-                if response.status == 200:
-                    buffer = BytesIO(await response.read())
-                else:
-                    print(
-                        "ElevenLabs Request failed with status code:", response.status
-                    )
-                    print("Response content:", await response.text())
-                    print("Falling back to aiogTTS")
-                    await self.aiogtts.write_to_fp(line, buffer)
-
-        buffer.seek(0)
-
         voice_guild = channel.guild
-        if voice_guild is not None:
-            # Check if we're already connected to a voice channel in this guild
-            voice_client = discord.utils.get(self.bot.voice_clients, guild=voice_guild)
-            if voice_client and voice_client.is_connected():
-                if voice_client.channel != channel:
-                    await voice_client.move_to(channel)
-            else:
-                voice_client = await channel.connect()
-
-            voice_client.play(FFmpegPCMAudio(buffer.read(), pipe=True))
-
-            # Wait for the audio to finish playing
-            while voice_client.is_playing():
-                await asyncio.sleep(0.5)
-                
-            # Check the queue length after playing the current line
-            if len(self.voice_queues[guild_id]) == 0:
-                await voice_client.disconnect()
-        else:
+        if voice_guild is None:
             await channel.send("You need to join a voice channel first!")
+            return
+
+        # Connect/move first so playback starts the moment audio is ready.
+        voice_client = discord.utils.get(self.bot.voice_clients, guild=voice_guild)
+        if voice_client and voice_client.is_connected():
+            if voice_client.channel != channel:
+                await voice_client.move_to(channel)
+        else:
+            voice_client = await channel.connect()
+
+        source = await self._build_audio_source(line)
+        voice_client.play(source)
+
+        # Wait for the audio to finish playing
+        while voice_client.is_playing():
+            await asyncio.sleep(0.2)
+
+        # Check the queue length after playing the current line
+        if len(self.voice_queues[guild_id]) == 0:
+            await voice_client.disconnect()
