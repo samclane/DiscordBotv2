@@ -12,6 +12,7 @@ from elevenlabs.client import ElevenLabs
 from audiofix import FFmpegStreamAudio
 from collections import defaultdict
 from enum import Enum, auto
+from typing import Optional
 
 # ElevenLabs voice/model configuration.
 ELEVENLABS_VOICE_ID = "EXAVITQu4vr4xnSDxMaL"
@@ -82,7 +83,7 @@ class VoiceCog(commands.Cog):
     @app_commands.command()
     @app_commands.describe(name="Your new announced name (leave empty to go back to your username)")
     async def set_voice_name(
-        self, interaction: discord.Interaction, name: str | None = None
+        self, interaction: discord.Interaction, name: Optional[str] = None
     ):
         """Set the name voice announcements call you; omit it to use your username."""
         if name is None:
