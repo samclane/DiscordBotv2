@@ -1,5 +1,6 @@
 import asyncio
 import itertools
+import time
 from io import BytesIO
 import discord
 from discord import app_commands
@@ -26,6 +27,8 @@ IDLE_DISCONNECT_DELAY = 30.0
 # Per-user settings (custom announced names), one sqlite file per cog like the
 # other cogs (economy.db, whitelist.db, ...).
 VOICE_DB = "voice.db"
+# Users may change their announced name at most once every 30 days.
+NAME_CHANGE_COOLDOWN = 30 * 24 * 60 * 60
 
 
 class EventType(Enum):
@@ -62,6 +65,13 @@ class VoiceCog(commands.Cog):
                 "user_id INTEGER PRIMARY KEY, "
                 "name TEXT NOT NULL)"
             )
+            # Cooldown timestamps live in their own table so clearing a name
+            # (which deletes the voice_names row) can't reset the cooldown.
+            await db.execute(
+                "CREATE TABLE IF NOT EXISTS voice_name_cooldowns ("
+                "user_id INTEGER PRIMARY KEY, "
+                "changed_at INTEGER NOT NULL)"
+            )
             await db.commit()
 
     def cog_unload(self):
@@ -93,11 +103,30 @@ class VoiceCog(commands.Cog):
             )
             return
 
+        now = int(time.time())
         async with aiosqlite.connect(VOICE_DB) as db:
+            async with db.execute(
+                "SELECT changed_at FROM voice_name_cooldowns WHERE user_id = ?",
+                (interaction.user.id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is not None and now - row[0] < NAME_CHANGE_COOLDOWN:
+                next_change = row[0] + NAME_CHANGE_COOLDOWN
+                await interaction.response.send_message(
+                    "You can only change your voice name once a month. "
+                    f"You can change it again <t:{next_change}:R> (<t:{next_change}:F>).",
+                    ephemeral=True,
+                )
+                return
             await db.execute(
                 "INSERT INTO voice_names (user_id, name) VALUES (?, ?) "
                 "ON CONFLICT(user_id) DO UPDATE SET name = excluded.name",
                 (interaction.user.id, name),
+            )
+            await db.execute(
+                "INSERT INTO voice_name_cooldowns (user_id, changed_at) VALUES (?, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET changed_at = excluded.changed_at",
+                (interaction.user.id, now),
             )
             await db.commit()
         await interaction.response.send_message(
