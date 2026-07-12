@@ -2,8 +2,10 @@ import asyncio
 import itertools
 from io import BytesIO
 import discord
+from discord import app_commands
 from discord.ext import commands
 from aiogtts import aiogTTS  # type: ignore
+import aiosqlite
 import os
 from elevenlabs.client import ElevenLabs
 from audiofix import FFmpegStreamAudio
@@ -15,12 +17,29 @@ ELEVENLABS_VOICE_ID = "EXAVITQu4vr4xnSDxMaL"
 ELEVENLABS_MODEL_ID = "eleven_flash_v2_5"
 # Streaming-friendly mp3 output; ffmpeg decodes it to Discord PCM on the fly.
 ELEVENLABS_OUTPUT_FORMAT = "mp3_44100_128"
+# Both TTS paths emit mp3, so tell ffmpeg the format up front and skip input
+# probing — otherwise it buffers incoming chunks before emitting any PCM.
+FFMPEG_BEFORE_OPTIONS = "-f mp3 -analyzeduration 0 -probesize 32"
+# Keep the voice connection warm after speaking so back-to-back announcements
+# skip the connect handshake. Set to 0 to disconnect immediately.
+IDLE_DISCONNECT_DELAY = 30.0
+# Per-user settings (custom announced names), one sqlite file per cog like the
+# other cogs (economy.db, whitelist.db, ...).
+VOICE_DB = "voice.db"
 
 
 class EventType(Enum):
     JOIN = auto()
     LEAVE = auto()
     AFK = auto()
+
+
+# (singular, plural) verb phrases for announcement messages.
+EVENT_PHRASES = {
+    EventType.JOIN: ("has joined", "have joined."),
+    EventType.LEAVE: ("has left", "have left."),
+    EventType.AFK: ("went A.F.K", "went A.F.K."),
+}
 
 
 class VoiceCog(commands.Cog):
@@ -33,8 +52,72 @@ class VoiceCog(commands.Cog):
         self.voice_queues = defaultdict(list)
         # Active tasks that process voice queues (guild_id -> task)
         self.queue_tasks = {}
-        # Batch timeout (seconds to wait before processing events)
-        self.batch_timeout = 0.5
+        # Pending idle-disconnect timers (guild_id -> task)
+        self.disconnect_timers = {}
+
+    async def cog_load(self):
+        async with aiosqlite.connect(VOICE_DB) as db:
+            await db.execute(
+                "CREATE TABLE IF NOT EXISTS voice_names ("
+                "user_id INTEGER PRIMARY KEY, "
+                "name TEXT NOT NULL)"
+            )
+            await db.commit()
+
+    def cog_unload(self):
+        for timer in self.disconnect_timers.values():
+            timer.cancel()
+        self.disconnect_timers.clear()
+
+    @app_commands.command()
+    @app_commands.describe(name="Your new announced name (leave empty to go back to your username)")
+    async def set_voice_name(
+        self, interaction: discord.Interaction, name: str | None = None
+    ):
+        """Set the name voice announcements call you; omit it to use your username."""
+        if name is None:
+            async with aiosqlite.connect(VOICE_DB) as db:
+                await db.execute(
+                    "DELETE FROM voice_names WHERE user_id = ?", (interaction.user.id,)
+                )
+                await db.commit()
+            await interaction.response.send_message(
+                "Voice announcements will use your username.", ephemeral=True
+            )
+            return
+
+        name = " ".join(name.split())
+        if not name or len(name) > 32:
+            await interaction.response.send_message(
+                "Names must be 1-32 characters.", ephemeral=True
+            )
+            return
+
+        async with aiosqlite.connect(VOICE_DB) as db:
+            await db.execute(
+                "INSERT INTO voice_names (user_id, name) VALUES (?, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET name = excluded.name",
+                (interaction.user.id, name),
+            )
+            await db.commit()
+        await interaction.response.send_message(
+            f'Voice announcements will call you "{name}".', ephemeral=True
+        )
+
+    async def _announced_names(self, members) -> dict[int, str]:
+        """Map member id -> announced name, preferring user-set names from voice.db."""
+        names = {m.id: m.name for m in members}
+        if not names:
+            return names
+        placeholders = ", ".join("?" for _ in names)
+        async with aiosqlite.connect(VOICE_DB) as db:
+            async with db.execute(
+                f"SELECT user_id, name FROM voice_names WHERE user_id IN ({placeholders})",
+                list(names),
+            ) as cursor:
+                for user_id, custom_name in await cursor.fetchall():
+                    names[user_id] = custom_name
+        return names
 
     @commands.Cog.listener()
     async def on_voice_state_update(
@@ -96,10 +179,12 @@ class VoiceCog(commands.Cog):
             self.queue_tasks[guild_id] = asyncio.create_task(self.process_voice_queue(guild_id))
 
     async def process_voice_queue(self, guild_id: int):
-        """Process and combine voice events in the queue for a specific guild."""
-        # Wait a short time to allow events to accumulate
-        await asyncio.sleep(self.batch_timeout)
-        
+        """Process and combine voice events in the queue for a specific guild.
+
+        No upfront delay: the first line in a burst plays immediately, and any
+        events arriving during TTS generation + playback are coalesced by the
+        loop below on the next pass.
+        """
         while self.voice_queues[guild_id]:
             # Group events by channel
             events_by_channel = defaultdict(list)
@@ -113,48 +198,38 @@ class VoiceCog(commands.Cog):
                 event_type, member, channel = event
                 events_by_channel[channel].append((event_type, member))
             
-            # Process each channel's events in order
-            for channel, channel_events in events_by_channel.items():
+            # Process the channel the bot is already sitting in first so a
+            # batch that includes it never pays for an extra move-away/move-back.
+            voice_client = discord.utils.get(self.bot.voice_clients, guild=self.bot.get_guild(guild_id))
+            current_channel = voice_client.channel if voice_client and voice_client.is_connected() else None
+            ordered_channels = sorted(
+                events_by_channel.items(), key=lambda item: item[0] != current_channel
+            )
+
+            for channel, channel_events in ordered_channels:
                 # First, generate all messages while preserving order
                 events_by_type = defaultdict(list)
-                
+
                 # Follow the original event order
                 for event_type, member in channel_events:
                     events_by_type[event_type].append(member)
-                
+
+                # Resolve custom announced names for the whole batch in one query.
+                unique_members = {m.id: m for _, m in channel_events}
+                names = await self._announced_names(unique_members.values())
+
                 messages = []
-                
+
                 # Generate messages for each event type that exists
                 for event_type, members in events_by_type.items():
-                    if event_type == EventType.JOIN:
-                        if len(members) == 1:
-                            messages.append(f"{members[0].name} has joined")
-                        elif len(members) == 2:
-                            messages.append(f"{members[0].name} and {members[1].name} have joined.")
-                        else:
-                            names = [m.name for m in members[:-1]]
-                            last_name = members[-1].name
-                            messages.append(f"{', '.join(names)}, and {last_name} have joined.")
-                    
-                    elif event_type == EventType.LEAVE:
-                        if len(members) == 1:
-                            messages.append(f"{members[0].name} has left")
-                        elif len(members) == 2:
-                            messages.append(f"{members[0].name} and {members[1].name} have left.")
-                        else:
-                            names = [m.name for m in members[:-1]]
-                            last_name = members[-1].name
-                            messages.append(f"{', '.join(names)}, and {last_name} have left.")
-                    
-                    elif event_type == EventType.AFK:
-                        if len(members) == 1:
-                            messages.append(f"{members[0].name} went A.F.K")
-                        elif len(members) == 2:
-                            messages.append(f"{members[0].name} and {members[1].name} went A.F.K.")
-                        else:
-                            names = [m.name for m in members[:-1]]
-                            last_name = members[-1].name
-                            messages.append(f"{', '.join(names)}, and {last_name} went A.F.K.")
+                    display = [names[m.id] for m in members]
+                    singular, plural = EVENT_PHRASES[event_type]
+                    if len(display) == 1:
+                        messages.append(f"{display[0]} {singular}")
+                    elif len(display) == 2:
+                        messages.append(f"{display[0]} and {display[1]} {plural}")
+                    else:
+                        messages.append(f"{', '.join(display[:-1])}, and {display[-1]} {plural}")
                 
                 # Combine all messages for this channel
                 if messages:
@@ -198,36 +273,68 @@ class VoiceCog(commands.Cog):
         """Build a streaming audio source, falling back to aiogTTS on failure."""
         try:
             byte_iterator = await self._open_elevenlabs_stream(line)
-            return FFmpegStreamAudio(byte_iterator)
+            return FFmpegStreamAudio(byte_iterator, before_options=FFMPEG_BEFORE_OPTIONS)
         except Exception as e:
             print(f"ElevenLabs streaming failed ({e}); falling back to aiogTTS")
             buffer = BytesIO()
             await self.aiogtts.write_to_fp(line, buffer)
             buffer.seek(0)
-            return FFmpegStreamAudio(iter([buffer.read()]))
+            return FFmpegStreamAudio(iter([buffer.read()]), before_options=FFMPEG_BEFORE_OPTIONS)
 
-    async def _play_voice_line(self, line: str, channel: discord.VoiceChannel, guild_id: int):
-        """Internal method that actually plays the voice line."""
-        voice_guild = channel.guild
-        if voice_guild is None:
-            await channel.send("You need to join a voice channel first!")
-            return
-
-        # Connect/move first so playback starts the moment audio is ready.
-        voice_client = discord.utils.get(self.bot.voice_clients, guild=voice_guild)
+    async def _ensure_voice_client(self, channel: discord.VoiceChannel) -> discord.VoiceClient:
+        """Return a voice client connected to the given channel, connecting or moving as needed."""
+        voice_client = discord.utils.get(self.bot.voice_clients, guild=channel.guild)
         if voice_client and voice_client.is_connected():
             if voice_client.channel != channel:
                 await voice_client.move_to(channel)
-        else:
-            voice_client = await channel.connect()
+            return voice_client
+        return await channel.connect()
 
-        source = await self._build_audio_source(line)
-        voice_client.play(source)
+    def _cancel_disconnect_timer(self, guild_id: int):
+        timer = self.disconnect_timers.pop(guild_id, None)
+        if timer is not None:
+            timer.cancel()
 
-        # Wait for the audio to finish playing
-        while voice_client.is_playing():
-            await asyncio.sleep(0.2)
+    def _schedule_disconnect(self, guild_id: int, voice_client: discord.VoiceClient):
+        """Disconnect after an idle period unless another line starts playing first."""
+        self._cancel_disconnect_timer(guild_id)
 
-        # Check the queue length after playing the current line
+        async def _disconnect_when_idle():
+            await asyncio.sleep(IDLE_DISCONNECT_DELAY)
+            if voice_client.is_connected() and not voice_client.is_playing():
+                await voice_client.disconnect()
+
+        self.disconnect_timers[guild_id] = asyncio.create_task(_disconnect_when_idle())
+
+    async def _play_voice_line(self, line: str, channel: discord.VoiceChannel, guild_id: int):
+        """Internal method that actually plays the voice line."""
+        self._cancel_disconnect_timer(guild_id)
+
+        # The TTS request and the voice connect handshake are independent network
+        # round-trips; run them concurrently so we only wait for the slower one.
+        source, voice_client = await asyncio.gather(
+            self._build_audio_source(line),
+            self._ensure_voice_client(channel),
+            return_exceptions=True,
+        )
+        if isinstance(voice_client, BaseException):
+            if not isinstance(source, BaseException):
+                source.cleanup()
+            raise voice_client
+        if isinstance(source, BaseException):
+            raise source
+
+        loop = asyncio.get_running_loop()
+        finished = asyncio.Event()
+
+        def _on_playback_done(error):
+            if error:
+                print(f"Voice playback error: {error}")
+            loop.call_soon_threadsafe(finished.set)
+
+        voice_client.play(source, after=_on_playback_done)
+        await finished.wait()
+
+        # Keep the connection warm briefly in case more announcements follow.
         if len(self.voice_queues[guild_id]) == 0:
-            await voice_client.disconnect()
+            self._schedule_disconnect(guild_id, voice_client)

@@ -44,6 +44,9 @@ class FFmpegStreamAudio(discord.AudioSource):
             for chunk in byte_iterator:
                 if chunk:
                     stdin.write(chunk)
+                    # stdin is buffered; push each chunk through to ffmpeg as it
+                    # arrives so decoding (and playback) starts immediately.
+                    stdin.flush()
         except (BrokenPipeError, OSError, ValueError):
             # Player stopped / process was cleaned up while we were still writing.
             pass
