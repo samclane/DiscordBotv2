@@ -1,5 +1,6 @@
 import asyncio
 import itertools
+import re
 import time
 from io import BytesIO
 import discord
@@ -46,6 +47,23 @@ EVENT_PHRASES = {
 }
 
 
+def apply_pronunciations(line: str, pronunciations: dict[str, str]) -> str:
+    """Replace whole-word, case-insensitive matches with their sounds-like spelling."""
+    if not pronunciations:
+        return line
+    lookup = {word.lower(): sounds_like for word, sounds_like in pronunciations.items()}
+    # Longest first so a phrase like "Sawyer Jr" wins over "Sawyer". Lookarounds
+    # instead of \b so words ending in punctuation ("C++") still match.
+    words = sorted(pronunciations, key=len, reverse=True)
+    pattern = rf"(?<!\w)(?:{'|'.join(map(re.escape, words))})(?!\w)"
+    return re.sub(
+        pattern,
+        lambda m: lookup.get(m.group(0).lower(), m.group(0)),
+        line,
+        flags=re.IGNORECASE,
+    )
+
+
 class VoiceCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -72,6 +90,12 @@ class VoiceCog(commands.Cog):
                 "CREATE TABLE IF NOT EXISTS voice_name_cooldowns ("
                 "user_id INTEGER PRIMARY KEY, "
                 "changed_at INTEGER NOT NULL)"
+            )
+            # Global word -> sounds-like respelling, applied to every spoken line.
+            await db.execute(
+                "CREATE TABLE IF NOT EXISTS pronunciations ("
+                "word TEXT PRIMARY KEY COLLATE NOCASE, "
+                "sounds_like TEXT NOT NULL)"
             )
             await db.commit()
 
@@ -133,6 +157,64 @@ class VoiceCog(commands.Cog):
         await interaction.response.send_message(
             f'Voice announcements will call you "{name}".', ephemeral=True
         )
+
+    @app_commands.command()
+    # ponytail: mods only since entries affect everyone; server admins can open it
+    # to all members under Server Settings > Integrations.
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.describe(
+        word="The word or name to fix, e.g. Sawyer",
+        sounds_like="How it should sound, spelled out, e.g. soy er (leave empty to remove)",
+    )
+    async def pronounce(
+        self, interaction: discord.Interaction, word: str, sounds_like: Optional[str] = None
+    ):
+        """Teach the announcer how to say a word; omit sounds_like to remove it."""
+        word = " ".join(word.split())
+        if sounds_like is None:
+            async with aiosqlite.connect(VOICE_DB) as db:
+                await db.execute("DELETE FROM pronunciations WHERE word = ?", (word,))
+                await db.commit()
+            await interaction.response.send_message(
+                f'Removed the pronunciation for "{word}".', ephemeral=True
+            )
+            return
+
+        sounds_like = " ".join(sounds_like.split())
+        if not word or len(word) > 32 or not sounds_like or len(sounds_like) > 64:
+            await interaction.response.send_message(
+                "Words must be 1-32 characters and pronunciations 1-64.", ephemeral=True
+            )
+            return
+
+        async with aiosqlite.connect(VOICE_DB) as db:
+            await db.execute(
+                "INSERT INTO pronunciations (word, sounds_like) VALUES (?, ?) "
+                "ON CONFLICT(word) DO UPDATE SET sounds_like = excluded.sounds_like",
+                (word, sounds_like),
+            )
+            await db.commit()
+
+        # Rendering the preview takes a moment; defer so the interaction doesn't expire.
+        await interaction.response.defer(ephemeral=True)
+        files = []
+        try:
+            stream = await self._open_elevenlabs_stream(f"{sounds_like} has joined")
+            audio = await asyncio.to_thread(b"".join, stream)
+            files.append(discord.File(BytesIO(audio), filename="preview.mp3"))
+        except Exception as e:
+            print(f"Pronunciation preview failed: {e}")
+        await interaction.followup.send(
+            f'Announcements will say "{word}" like "{sounds_like}". '
+            "Run this again with a different spelling if it sounds off.",
+            files=files,
+            ephemeral=True,
+        )
+
+    async def _pronunciations(self) -> dict[str, str]:
+        async with aiosqlite.connect(VOICE_DB) as db:
+            async with db.execute("SELECT word, sounds_like FROM pronunciations") as cursor:
+                return dict(await cursor.fetchall())
 
     async def _announced_names(self, members) -> dict[int, str]:
         """Map member id -> announced name, preferring user-set names from voice.db."""
@@ -301,6 +383,8 @@ class VoiceCog(commands.Cog):
 
     async def _build_audio_source(self, line: str) -> FFmpegStreamAudio:
         """Build a streaming audio source, falling back to aiogTTS on failure."""
+        # Plain-text respellings, so they help the aiogTTS fallback too.
+        line = apply_pronunciations(line, await self._pronunciations())
         try:
             byte_iterator = await self._open_elevenlabs_stream(line)
             return FFmpegStreamAudio(byte_iterator, before_options=FFMPEG_BEFORE_OPTIONS)
