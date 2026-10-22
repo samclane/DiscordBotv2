@@ -161,7 +161,7 @@ class VoiceCog(commands.Cog):
     @app_commands.command()
     # ponytail: mods only since entries affect everyone; server admins can open it
     # to all members under Server Settings > Integrations.
-    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.default_permissions(manage_messages=True)
     @app_commands.describe(
         word="The word or name to fix, e.g. Sawyer",
         sounds_like="How it should sound, spelled out, e.g. soy er (leave empty to remove)",
