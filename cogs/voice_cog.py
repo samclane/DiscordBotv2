@@ -99,7 +99,7 @@ class VoiceCog(commands.Cog):
             )
             await db.commit()
 
-    def cog_unload(self):
+    async def cog_unload(self):
         for timer in self.disconnect_timers.values():
             timer.cancel()
         self.disconnect_timers.clear()
@@ -214,7 +214,8 @@ class VoiceCog(commands.Cog):
     async def _pronunciations(self) -> dict[str, str]:
         async with aiosqlite.connect(VOICE_DB) as db:
             async with db.execute("SELECT word, sounds_like FROM pronunciations") as cursor:
-                return dict(await cursor.fetchall())
+                rows = await cursor.fetchall()
+                return {str(word): str(sounds_like) for word, sounds_like in rows}
 
     async def _announced_names(self, members) -> dict[int, str]:
         """Map member id -> announced name, preferring user-set names from voice.db."""
@@ -369,6 +370,7 @@ class VoiceCog(commands.Cog):
             raise RuntimeError("ElevenLabs API key not configured (XI_API_KEY)")
 
         def _start():
+            assert self.elevenlabs is not None
             stream = self.elevenlabs.text_to_speech.stream(
                 ELEVENLABS_VOICE_ID,
                 text=line,
